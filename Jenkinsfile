@@ -1,59 +1,48 @@
-properties(
-  [
-    disableConcurrentBuilds()
-  ]
-)
+#!/usr/bin/env groovy
 
-// https://issues.jenkins-ci.org/browse/JENKINS-33511
-def set_workspace() {
-  if(env.WORKSPACE == null) {
-    env.WORKSPACE = WORKSPACE = pwd()
-  }
-}
+node {
+    checkout scm
+    def commonlib = load("pipeline-scripts/commonlib.groovy")
+    properties([
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '')),
+        disableConcurrentBuilds(),
+        [
+            $class: 'ParametersDefinitionProperty',
+            parameterDefinitions: [
+                [
+                    name: 'DRY_RUN',
+                    description: 'Take no action, just echo what the build would have done.',
+                    $class: 'BooleanParameterDefinition',
+                    defaultValue: false
+                ],
+                [
+                    name: 'NEW_VERSION',
+                    description: '(Optional) version for build instead of most recent\nor "+" to bump most recent version',
+                    $class: 'StringParameterDefinition',
+                    defaultValue: ""
+                ],
+                [
+                    name: 'FORCE_BUILD',
+                    description: 'Build regardless of whether source has changed',
+                    $class: 'BooleanParameterDefinition',
+                    defaultValue: false
+                ],
+                commonlib.mockParam(),
+            ]
+        ]
+    ])
 
-node('openshift-build-1') {
-  try {
-    timeout(time: 30, unit: 'MINUTES') {
-      deleteDir()
-      set_workspace()
-      dir('aos-cd-jobs') {
-        stage('clone') {
-          checkout scm
-          sh 'git checkout master'
-        }
-        stage('run') {
-          final url = sh(
-            returnStdout: true,
-            script: 'git config remote.origin.url')
-          if(!(url =~ /^[-\w]+@[-\w]+(\.[-\w]+)*:/)) {
-            error('This job uses ssh keys for auth, please use an ssh url')
-          }
-          def prune = true, key = 'openshift-bot'
-          if(url.trim() != 'git@github.com:openshift/aos-cd-jobs.git') {
-            prune = false
-            key = "${(url =~ /.*:([^\/]+)/)[0][1]}-aos-cd-bot"
-          }
-          sshagent([key]) {
-            sh """\
-virtualenv ../env/
-. ../env/bin/activate
-pip install gitpython
-${prune ? 'python -m aos_cd_jobs.pruner' : 'echo Fork, skipping pruner'}
-python -m aos_cd_jobs.updater
-"""
-          }
-        }
-      }
-    }
-  } catch(err) {
-    mail(
-      to: 'tbielawa@redhat.com, jupierce@redhat.com',
-      from: "aos-cicd@redhat.com",
-      subject: 'aos-cd-jobs-branches job: error',
-      body: """\
-Encoutered an error while running the aos-cd-jobs-branches job: ${err}\n\n
-Jenkins job: ${env.BUILD_URL}
-""")
-    throw err
-  }
+    commonlib.checkMock()
+    currentBuild.displayName = "ocp: [${params.NEW_VERSION ?: '4.2'}]"
+
+    b = build job: 'build%2Focp4', propagate: false,
+        parameters: [
+            string(name: 'BUILD_VERSION', value: '4.2'),
+            string(name: 'NEW_VERSION', value: params.NEW_VERSION),
+            booleanParam(name: 'FORCE_BUILD', value: params.FORCE_BUILD),
+            booleanParam(name: 'DRY_RUN', value: params.DRY_RUN),
+        ]
+
+    currentBuild.displayName = "ocp:${b.displayName}"
+    currentBuild.result = b.result
 }
