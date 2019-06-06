@@ -1,59 +1,63 @@
-properties(
-  [
-    disableConcurrentBuilds()
-  ]
-)
+node {
+    checkout scm
+    def buildlib = load("pipeline-scripts/buildlib.groovy")
+    def commonlib = buildlib.commonlib
+    // Expose properties for a parameterized build
+    properties(
+        [
+            buildDiscarder(
+                logRotator(
+                    artifactDaysToKeepStr: '',
+                    artifactNumToKeepStr: '',
+                    daysToKeepStr: '',
+                    numToKeepStr: '100')
+                ),
+                [
+                $class: 'ParametersDefinitionProperty',
+                parameterDefinitions: [
+                    [
+                        name: 'BASE_IMAGE_TAGS',
+                        description: 'list of openshift cve base images.',
+                        $class: 'hudson.model.StringParameterDefinition',
+                        defaultValue: commonlib.ocpBaseImages.join(',')
+                    ],
+                    commonlib.suppressEmailParam(),
+                    [
+                        name: 'MAIL_LIST_FAILURE',
+                        description: 'Failure Mailing List',
+                        $class: 'hudson.model.StringParameterDefinition',
+                        defaultValue: 'aos-team-art@redhat.com'
+                    ],
+                    commonlib.mockParam(),
+                ]
+            ],
+            disableConcurrentBuilds()
+        ]
+    )
 
-// https://issues.jenkins-ci.org/browse/JENKINS-33511
-def set_workspace() {
-  if(env.WORKSPACE == null) {
-    env.WORKSPACE = WORKSPACE = pwd()
-  }
-}
+    commonlib.checkMock()
+    buildlib.initialize()
+    def imageName = params.BASE_IMAGE_TAGS.replaceAll(',', ' ').split()
 
-node('openshift-build-1') {
-  try {
-    timeout(time: 30, unit: 'MINUTES') {
-      deleteDir()
-      set_workspace()
-      dir('aos-cd-jobs') {
-        stage('clone') {
-          checkout scm
-          sh 'git checkout master'
+
+    currentBuild.displayName = "#${currentBuild.number} Update base images"
+    currentBuild.description = ""
+    try {
+		for(int i = 0; i < imageName.size(); ++i) {
+             currentBuild.description += "Built ${imageName[i]}\n"
+             commonlib.shell(
+                script: "./build.sh ${imageName[i]}"
+             )
         }
-        stage('run') {
-          final url = sh(
-            returnStdout: true,
-            script: 'git config remote.origin.url')
-          if(!(url =~ /^[-\w]+@[-\w]+(\.[-\w]+)*:/)) {
-            error('This job uses ssh keys for auth, please use an ssh url')
-          }
-          def prune = true, key = 'openshift-bot'
-          if(url.trim() != 'git@github.com:openshift/aos-cd-jobs.git') {
-            prune = false
-            key = "${(url =~ /.*:([^\/]+)/)[0][1]}-aos-cd-bot"
-          }
-          sshagent([key]) {
-            sh """\
-virtualenv ../env/
-. ../env/bin/activate
-pip install gitpython
-${prune ? 'python -m aos_cd_jobs.pruner' : 'echo Fork, skipping pruner'}
-python -m aos_cd_jobs.updater
-"""
-          }
-        }
-      }
+    } catch (err) {
+        commonlib.email(
+            to: "${params.MAIL_LIST_FAILURE}",
+            from: "aos-team-art@redhat.com",
+            subject: "Unexpected error during CVEs update streams.yml!",
+            body: "Encountered an unexpected error while running update base images: ${err}"
+        )
+        currentBuild.description = "Built ${imageName[i]} error: ${err}\n"
+
+        throw err
     }
-  } catch(err) {
-    mail(
-      to: 'tbielawa@redhat.com, jupierce@redhat.com',
-      from: "aos-cicd@redhat.com",
-      subject: 'aos-cd-jobs-branches job: error',
-      body: """\
-Encoutered an error while running the aos-cd-jobs-branches job: ${err}\n\n
-Jenkins job: ${env.BUILD_URL}
-""")
-    throw err
-  }
 }
