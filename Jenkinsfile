@@ -22,9 +22,9 @@ node {
                         description: 'Failure Mailing List',
                         $class: 'hudson.model.StringParameterDefinition',
                         defaultValue: [
-                            'aos-team-art@redhat.com',
+                            'aos-art-automation+failed-odo-sync@redhat.com',
                             'moahmed@redhat.com'
-                        ].join(',')
+                        ]
                     ],
                     commonlib.mockParam(),
                 ]
@@ -36,13 +36,16 @@ node {
     try {
         sshagent(['aos-cd-test']) {
             stage("sync odo") {
-                buildlib.invoke_on_rcm_guest("publish-odo-binary.sh")
+                withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'accessToken')]) {
+                    buildlib.invoke_on_rcm_guest("publish-odo-binary.sh ${accessToken}")
+                }
             }
         }
     } catch (err) {
         commonlib.email(
             to: "${params.MAIL_LIST_FAILURE}",
-            from: "aos-cicd@redhat.com",
+            from: "aos-art-automation@redhat.com",
+            replyTo: "aos-team-art@redhat.com",
             subject: "Error syncing odo client",
             body: "Encountered an error while syncing odo client: ${err}");
         currentBuild.description = "Error while syncing odo client:\n${err}"
