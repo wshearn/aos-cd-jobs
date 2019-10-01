@@ -1,59 +1,90 @@
-properties(
-  [
-    disableConcurrentBuilds()
-  ]
-)
+#!/usr/bin/env groovy
 
-// https://issues.jenkins-ci.org/browse/JENKINS-33511
-def set_workspace() {
-  if(env.WORKSPACE == null) {
-    env.WORKSPACE = WORKSPACE = pwd()
-  }
-}
+node {
+    checkout scm
+    def build = load("build.groovy")
+    def buildlib = build.buildlib
+    def commonlib = build.commonlib
 
-node('openshift-build-1') {
-  try {
-    timeout(time: 30, unit: 'MINUTES') {
-      deleteDir()
-      set_workspace()
-      dir('aos-cd-jobs') {
-        stage('clone') {
-          checkout scm
-          sh 'git checkout master'
-        }
-        stage('run') {
-          final url = sh(
-            returnStdout: true,
-            script: 'git config remote.origin.url')
-          if(!(url =~ /^[-\w]+@[-\w]+(\.[-\w]+)*:/)) {
-            error('This job uses ssh keys for auth, please use an ssh url')
-          }
-          def prune = true, key = 'openshift-bot'
-          if(url.trim() != 'git@github.com:openshift/aos-cd-jobs.git') {
-            prune = false
-            key = "${(url =~ /.*:([^\/]+)/)[0][1]}-aos-cd-bot"
-          }
-          sshagent([key]) {
-            sh """\
-virtualenv ../env/
-. ../env/bin/activate
-pip install gitpython
-${prune ? 'python -m aos_cd_jobs.pruner' : 'echo Fork, skipping pruner'}
-python -m aos_cd_jobs.updater
-"""
-          }
-        }
-      }
+    properties(
+        [
+            buildDiscarder(
+                logRotator(
+                    artifactDaysToKeepStr: '',
+                    artifactNumToKeepStr: '30',
+                    daysToKeepStr: '',
+                    numToKeepStr: '30'
+                )
+            ),
+            [
+                $class : 'ParametersDefinitionProperty',
+                parameterDefinitions: [
+                    commonlib.suppressEmailParam(),
+                    [
+                        name: 'RELEASE_URL',
+                        description: '(REQUIRED) Directory listing to latest release',
+                        $class: 'hudson.model.StringParameterDefinition',
+                    ],                    [
+                        name: 'MAIL_LIST_SUCCESS',
+                        description: '(Optional) Success Mailing List',
+                        $class: 'hudson.model.StringParameterDefinition',
+                        defaultValue: "aos-art-automation+new-crc-release@redhat.com",
+                    ],
+                    [
+                        name: 'MAIL_LIST_FAILURE',
+                        description: 'Failure Mailing List',
+                        $class: 'hudson.model.StringParameterDefinition',
+                        defaultValue: 'aos-art-automation+failed-crc-release@redhat.com',
+                    ],
+                    [
+                        name: 'DRY_RUN',
+                        description: 'Do not rsync the bits. Just download them and show what would have been copied',
+                        $class: 'BooleanParameterDefinition',
+                        defaultValue: false
+                    ],
+                    commonlib.mockParam(),
+                ]
+            ],
+            disableConcurrentBuilds(),
+        ]
+    )
+
+    commonlib.checkMock()
+
+    stage("Initialize") {
+        buildlib.kinit()
+	build.initialize()
+        currentBuild.displayName = "CVP #${currentBuild.number}"
     }
-  } catch(err) {
-    mail(
-      to: 'tbielawa@redhat.com, jupierce@redhat.com',
-      from: "aos-cicd@redhat.com",
-      subject: 'aos-cd-jobs-branches job: error',
-      body: """\
-Encountered an error while running the aos-cd-jobs-branches job: ${err}\n\n
-Jenkins job: ${env.BUILD_URL}
-""")
-    throw err
-  }
+
+    try {
+        sshagent(["openshift-bot"]) {
+            stage("Download release") { build.crcDownloadRelease(params.RELEASE_URL) }
+	    // stage("") {}
+        }
+        // build.mailForSuccess()
+    } catch (err) {
+        // currentBuild.description += "\n-----------------\n\n${err}\n-----------------\n"
+        currentBuild.result = "FAILURE"
+
+//         if (params.MAIL_LIST_FAILURE.trim()) {
+//             commonlib.email(
+//                 to: params.MAIL_LIST_FAILURE,
+//                 from: "aos-art-automation+failed-crc-release@redhat.com",
+//                 replyTo: "aos-team-art@redhat.com",
+//                 subject: "Error releasing Code Ready Containers",
+//                 body:
+//                     """
+// message here
+// """
+//             )
+//         }
+        throw err  // gets us a stack trace FWIW
+    } finally {
+        commonlib.safeArchiveArtifacts([
+                'email/*',
+                'shell/*',
+            ]
+        )
+    }
 }
