@@ -1,59 +1,87 @@
-properties(
-  [
-    disableConcurrentBuilds()
-  ]
-)
+#!/usr/bin/env groovy
 
-// https://issues.jenkins-ci.org/browse/JENKINS-33511
-def set_workspace() {
-  if(env.WORKSPACE == null) {
-    env.WORKSPACE = WORKSPACE = pwd()
-  }
-}
+node {
+    checkout scm
+    def buildlib = load("pipeline-scripts/buildlib.groovy")
+    def commonlib = buildlib.commonlib
 
-node('openshift-build-1') {
-  try {
-    timeout(time: 30, unit: 'MINUTES') {
-      deleteDir()
-      set_workspace()
-      dir('aos-cd-jobs') {
-        stage('clone') {
-          checkout scm
-          sh 'git checkout master'
+    // Expose properties for a parameterized build
+    properties(
+        [
+            buildDiscarder(
+                logRotator(
+                    artifactDaysToKeepStr: '',
+                    artifactNumToKeepStr: '',
+                    daysToKeepStr: '',
+                    numToKeepStr: '')),
+            [
+                $class: 'ParametersDefinitionProperty',
+                parameterDefinitions: [
+                    [
+                        name: 'STREAM',
+                        description: 'Build stream to sync client from',
+                        $class: 'hudson.model.ChoiceParameterDefinition',
+                        choices: [
+                            "4-stable",
+                            "4.1.0-0.nightly",
+                            "4.2.0-0.nightly",
+                            "4.3.0-0.nightly",
+                        ].join("\n"),
+                        defaultValue: "4-stable"
+                    ],
+                    [
+                        name: 'CLIENT_TYPE',
+                        description: 'artifacts path under https://mirror.openshift.com',
+                        $class: 'hudson.model.ChoiceParameterDefinition',
+                        choices: [
+                            "ocp",
+                            "ocp-dev-preview",
+                        ].join("\n"),
+                        defaultValue: "ocp"
+                    ],
+                    [
+                        name: 'MAIL_LIST_FAILURE',
+                        description: 'Failure Mailing List',
+                        $class: 'hudson.model.StringParameterDefinition',
+                        defaultValue: [
+                            'aos-art-automation+failed-oc-sync@redhat.com'
+                        ].join(',')
+                    ],
+                    commonlib.suppressEmailParam(),
+                    commonlib.mockParam(),
+                ]
+            ],
+            disableConcurrentBuilds()
+        ]
+    )
+
+    commonlib.checkMock()
+
+
+
+    try {
+        sshagent(['aos-cd-test']) {
+            stage("sync ocp clients") {
+		// must be able to access remote registry to extract image contents
+		buildlib.registry_quay_dev_login()
+                sh "./publish-clients-from-payload.sh ${env.WORKSPACE} ${STREAM} x86_64 ${CLIENT_TYPE}"
+            }
         }
-        stage('run') {
-          final url = sh(
-            returnStdout: true,
-            script: 'git config remote.origin.url')
-          if(!(url =~ /^[-\w]+@[-\w]+(\.[-\w]+)*:/)) {
-            error('This job uses ssh keys for auth, please use an ssh url')
-          }
-          def prune = true, key = 'openshift-bot'
-          if(url.trim() != 'git@github.com:openshift/aos-cd-jobs.git') {
-            prune = false
-            key = "${(url =~ /.*:([^\/]+)/)[0][1]}-aos-cd-bot"
-          }
-          sshagent([key]) {
-            sh """\
-virtualenv ../env/
-. ../env/bin/activate
-pip install gitpython
-${prune ? 'python -m aos_cd_jobs.pruner' : 'echo Fork, skipping pruner'}
-python -m aos_cd_jobs.updater
-"""
-          }
-        }
-      }
+    } catch (err) {
+        def buildURL = env.BUILD_URL.replace('https://buildvm.openshift.eng.bos.redhat.com:8443', 'https://localhost:8888')
+        commonlib.email(
+            to: "${params.MAIL_LIST_FAILURE}",
+            from: "aos-art-automation@redhat.com",
+            replyTo: "aos-team-art@redhat.com",
+            subject: "Error syncing ocp client from payload",
+            body: """Encountered an error while syncing ocp client from payload: ${err}
+
+Jenkins Job: ${buildURL}
+
+""");
+        currentBuild.description = "Error while syncing ocp client from payload:\n${err}"
+        currentBuild.result = "FAILURE"
+        throw err
     }
-  } catch(err) {
-    mail(
-      to: 'tbielawa@redhat.com, jupierce@redhat.com',
-      from: "aos-cicd@redhat.com",
-      subject: 'aos-cd-jobs-branches job: error',
-      body: """\
-Encountered an error while running the aos-cd-jobs-branches job: ${err}\n\n
-Jenkins job: ${env.BUILD_URL}
-""")
-    throw err
-  }
+    buildlib.cleanWorkdir("${env.WORKSPACE}")
 }
